@@ -1,11 +1,8 @@
-from cgi import test
-from numpy import block
 import torch
-from torch._refs import new_empty
 import triton
 import triton.language as tl
 
-DEVICE = torch.device(torch.cuda.current_device())
+DEVICE = torch.device("cuda:0")
 
 @triton.jit # to tell triton to compile function into gpu
 # block size param is static and can be known at compile time (does not change) 
@@ -24,8 +21,8 @@ def add_kernel(p_ptr, q_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # a mask to save memory if we have more vector that need a new block (if not a multiple of block size)
     mask = offset < n_elements
     # load data from memory to SRAM
-    p = tl.load(p_ptr + offset, mask = mask)  
-    q = tl.load(q_ptr + offset, mask = mask)
+    p = tl.load(p_ptr + offset, mask = mask, other = None)  
+    q = tl.load(q_ptr + offset, mask = mask, other = None)
 
     output = p+q
 
@@ -64,7 +61,44 @@ def test_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     torch.testing.assert_close(r_triton, r_torch, atol=atol, rtol=rtol)
     print('test passed')
 
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['size'], # x axis for the plot
+        x_vals=[2**i for i in range(12, 28, 1)], # different values of x_names to benchmark
+        x_log = True, # makes x-axis logarithmic
+        line_arg='provider',
+        line_vals=['triton', 'torch'], 
+        line_names=['Triton', 'Torch'], 
+        styles=[('blue', '-'), ('green', '-')],
+        ylabel='GB/s', 
+        plot_name='vector-addition-performance',
+        args={},
+    )
+)
+
+def benchmark(size,provider):
+    p = torch.rand(size, device=DEVICE, dtype=torch.float32)
+    q = torch.rand(size, device=DEVICE, dtype=torch.float32)
+
+    quantiles = [0.5, 0.05, 0.95]
+
+    if provider == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: p + q, quantiles=quantiles)
+    elif provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(p, q), quantiles=quantiles)
+    # turning the raw millisecond measurement into meaninful units
+    gbps = lambda ms: 3 * p.numel() * p.element_size() * 1e-9 / (ms * 1e-3)
+        # 3 = number of memory operations (2 reads + 1 write)
+        # x.element_size() = bytes per element (4 for float32, 2 for float16)
+        # 1e-9 converts bytes to GB
+        # 1e-3 converts milliseconds to seconds
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+
 if __name__ == "__main__":
-    test_kernel(size=4096)
-    test_kernel(size=4097)
     test_kernel(size=238297)
+
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--benchmark':
+        benchmark.run(save_path='.', print_data=False)
